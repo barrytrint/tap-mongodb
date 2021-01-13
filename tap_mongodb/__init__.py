@@ -6,6 +6,7 @@ import sys
 import time
 import pymongo
 from bson import timestamp
+from urllib.parse import quote as url_encode
 
 import singer
 from singer import metadata, metrics, utils
@@ -19,8 +20,7 @@ import tap_mongodb.sync_strategies.incremental as incremental
 LOGGER = singer.get_logger()
 
 REQUIRED_CONFIG_KEYS = [
-    'host',
-    'port',
+    'uri',
     'user',
     'password',
     'database'
@@ -52,67 +52,68 @@ ROLES_WITH_ALL_DB_FIND_PRIVILEGES = {
 }
 
 
-def get_roles(client, config):
-    # usersInfo Command returns object in shape:
-    # {
-    #     <some_other_keys>
-    #     'users': [
-    #         {
-    #             '_id': <auth_db>.<user>,
-    #             'db': <auth_db>,
-    #             'mechanisms': ['SCRAM-SHA-1', 'SCRAM-SHA-256'],
-    #             'roles': [{'db': 'admin', 'role': 'readWriteAnyDatabase'},
-    #                       {'db': 'local', 'role': 'read'}],
-    #             'user': <user>,
-    #             'userId': <userId>
-    #         }
-    #     ]
-    # }
-    user_info = client[config['database']].command({'usersInfo': config['user']})
+# def get_roles(client, config):
+#     # usersInfo Command returns object in shape:
+#     # {
+#     #     <some_other_keys>
+#     #     'users': [
+#     #         {
+#     #             '_id': <auth_db>.<user>,
+#     #             'db': <auth_db>,
+#     #             'mechanisms': ['SCRAM-SHA-1', 'SCRAM-SHA-256'],
+#     #             'roles': [{'db': 'admin', 'role': 'readWriteAnyDatabase'},
+#     #                       {'db': 'local', 'role': 'read'}],
+#     #             'user': <user>,
+#     #             'userId': <userId>
+#     #         }
+#     #     ]
+#     # }
+#     user_info = client[config['database']].command({'usersInfo': config['user']})
 
-    users = [u for u in user_info.get('users') if u.get('user') == config['user']]
-    if len(users) != 1:
-        LOGGER.warning('Could not find any users for %s', config['user'])
-        return []
+#     users = [u for u in user_info.get('users') if u.get('user') == config['user']]
+#     if len(users) != 1:
+#         LOGGER.warning('Could not find any users for %s', config['user'])
+#         return []
 
-    roles = []
-    for role in users[0].get('roles', []):
-        if role.get('role') is None:
-            continue
+#     roles = []
+#     for role in users[0].get('roles', []):
+#         if role.get('role') is None:
+#             continue
 
-        role_name = role['role']
-        # roles without find privileges
-        if role_name in ROLES_WITHOUT_FIND_PRIVILEGES:
-            continue
+#         role_name = role['role']
+#         # roles without find privileges
+#         if role_name in ROLES_WITHOUT_FIND_PRIVILEGES:
+#             continue
 
-        # roles with find privileges
-        if role_name in ROLES_WITH_FIND_PRIVILEGES:
-            if role.get('db'):
-                roles.append(role)
+#         # roles with find privileges
+#         if role_name in ROLES_WITH_FIND_PRIVILEGES:
+#             if role.get('db'):
+#                 roles.append(role)
 
-        # for custom roles, get the "sub-roles"
-        else:
-            role_info_list = client[config['database']].command(
-                {'rolesInfo': {'role': role_name, 'db': config['database']}})
-            role_info = [r for r in role_info_list.get('roles', []) if r['role'] == role_name]
-            if len(role_info) != 1:
-                continue
-            for sub_role in role_info[0].get('roles', []):
-                if sub_role.get('role') in ROLES_WITH_FIND_PRIVILEGES:
-                    if sub_role.get('db'):
-                        roles.append(sub_role)
-    return roles
+#         # for custom roles, get the "sub-roles"
+#         else:
+#             role_info_list = client[config['database']].command(
+#                 {'rolesInfo': {'role': role_name, 'db': config['database']}})
+#             role_info = [r for r in role_info_list.get('roles', []) if r['role'] == role_name]
+#             if len(role_info) != 1:
+#                 continue
+#             for sub_role in role_info[0].get('roles', []):
+#                 if sub_role.get('role') in ROLES_WITH_FIND_PRIVILEGES:
+#                     if sub_role.get('db'):
+#                         roles.append(sub_role)
+#     return roles
 
 def get_databases(client, config):
-    roles = get_roles(client, config)
-    LOGGER.info('Roles: %s', roles)
+#    roles = get_roles(client, config)
+#    LOGGER.info('Roles: %s', roles)
 
-    can_read_all = len([r for r in roles if r['role'] in ROLES_WITH_ALL_DB_FIND_PRIVILEGES]) > 0
+ #   can_read_all = len([r for r in roles if r['role'] in ROLES_WITH_ALL_DB_FIND_PRIVILEGES]) > 0
 
-    if can_read_all:
-        db_names = [d for d in client.list_database_names() if d not in IGNORE_DBS]
-    else:
-        db_names = [r['db'] for r in roles if r['db'] not in IGNORE_DBS]
+#    if can_read_all:
+#        db_names = [d for d in client.list_database_names() if d not in IGNORE_DBS]
+#    else:
+#    db_names = [r['db'] for r in roles if r['db'] not in IGNORE_DBS]
+    db_names = [config['database']]
     LOGGER.info('Datbases: %s', db_names)
     return db_names
 
@@ -353,27 +354,20 @@ def main_impl():
     args = utils.parse_args(REQUIRED_CONFIG_KEYS)
     config = args.config
 
-    # Default SSL verify mode to true, give option to disable
-    verify_mode = config.get('verify_mode', 'true') == 'true'
-    use_ssl = config.get('ssl') == 'true'
+    qualifiedUri = config['uri'].format(
+        user=url_encode(config['user']),
+        password=url_encode(config['password']),
+        database=url_encode(config['database'])
+    )
 
-    connection_params = {"host": config['host'],
-                         "port": int(config['port']),
-                         "username": config.get('user', None),
-                         "password": config.get('password', None),
-                         "authSource": config['database'],
-                         "ssl": use_ssl,
-                         "replicaset": config.get('replica_set', None),
-                         "readPreference": 'secondaryPreferred'}
-
-    # NB: "ssl_cert_reqs" must ONLY be supplied if `SSL` is true.
-    if not verify_mode and use_ssl:
-        connection_params["ssl_cert_reqs"] = ssl.CERT_NONE
-
-    client = pymongo.MongoClient(**connection_params)
+    client = pymongo.MongoClient(qualifiedUri)
 
     LOGGER.info('Connected to MongoDB host: %s, version: %s',
-                config['host'],
+                config['uri'].format(
+                    user=config['user'],
+                    password='XXXXXX',
+                    database=config['database']
+                ),
                 client.server_info().get('version', 'unknown'))
 
     common.INCLUDE_SCHEMAS_IN_DESTINATION_STREAM_NAME = \
